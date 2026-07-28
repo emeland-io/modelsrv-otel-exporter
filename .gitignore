@@ -1,0 +1,28 @@
+# Binaries
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test / coverage
+*.out
+*.test
+coverage.out
+coverage.html
+profile.cov
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/

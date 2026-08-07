@@ -96,6 +96,41 @@ var _ = Describe("MetricMapper.Reconcile", func() {
 	})
 })
 
+var _ = Describe("MetricMapper.ReconcileProbeFailed", func() {
+	var (
+		mapper        *emelandexporter.MetricMapper
+		apiInstanceID uuid.UUID
+	)
+
+	BeforeEach(func() {
+		apiInstanceID = uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+		mapper = emelandexporter.NewMetricMapperForTest(30*24*time.Hour, nil)
+	})
+
+	It("produces CertificateProbeFailed and deletes ExpiringSoon/Expired", func() {
+		evs := mapper.ReconcileProbeFailed(apiInstanceID, "connection refused")
+
+		upserts, deletes := splitEvents(evs)
+		Expect(upserts).To(HaveLen(1))
+		f := upserts[0].Objects[0].(finding.Finding)
+		Expect(f.GetFindingTypeId()).To(Equal(finding.TypeIDForKind(finding.CertificateProbeFailed)))
+		Expect(f.GetDescription()).To(ContainSubstring("connection refused"))
+		Expect(deletes).To(HaveLen(2))
+		Expect(upserts[0].ResourceId).To(Equal(expectedFindingID(apiInstanceID, finding.CertificateProbeFailed)))
+	})
+
+	It("omits error detail when errMsg is empty", func() {
+		evs := mapper.ReconcileProbeFailed(apiInstanceID, "")
+
+		upserts, _ := splitEvents(evs)
+		Expect(upserts).To(HaveLen(1))
+		f := upserts[0].Objects[0].(finding.Finding)
+		Expect(f.GetDescription()).To(Equal(
+			"CertificateProbeFailed: probe of ApiInstance " + apiInstanceID.String() + " failed",
+		))
+	})
+})
+
 // --- helpers ---
 
 func splitEvents(evs []events.Event) (upserts, deletes []events.Event) {

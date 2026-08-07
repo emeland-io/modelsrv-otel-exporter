@@ -1,9 +1,10 @@
 // Package emelandexporter implements the OTel Collector exporter component that
 // maps httpcheck TLS metrics into EmELand Finding events.
 //
-// This file contains the pure mapping logic: given a metric value (seconds until
-// certificate expiry) and an ApiInstance UUID, produce the correct Finding events.
-// It has no dependency on OTel pdata types so it can be tested in isolation.
+// This file contains the pure mapping logic: given a probe outcome (failure or
+// seconds until certificate expiry) and an ApiInstance UUID, produce the correct
+// Finding events. It has no dependency on OTel pdata types so it can be tested
+// in isolation.
 package emelandexporter
 
 import (
@@ -35,7 +36,7 @@ func newMetricMapper(threshold time.Duration, log *zap.SugaredLogger) *metricMap
 	return &metricMapper{threshold: threshold, log: log}
 }
 
-// Reconcile applies the same decision table as endpointprobe.reconcileFinding:
+// Reconcile applies the success/has-cert branch of endpointprobe.reconcileFinding:
 //
 //	remaining > threshold   -> delete all cert findings (resolved)
 //	0 < remaining <= thresh -> CertificateExpiringSoon
@@ -68,6 +69,21 @@ func (m *metricMapper) Reconcile(apiInstanceID uuid.UUID, remaining time.Duratio
 			m.deleteFinding(apiInstanceID, finding.CertificateProbeFailed),
 		)
 	}
+}
+
+// ReconcileProbeFailed applies the !Success branch of endpointprobe.reconcileFinding:
+// upsert CertificateProbeFailed and delete ExpiringSoon/Expired.
+// errMsg is optional detail from the httpcheck error.message attribute.
+func (m *metricMapper) ReconcileProbeFailed(apiInstanceID uuid.UUID, errMsg string) []events.Event {
+	desc := fmt.Sprintf("CertificateProbeFailed: probe of ApiInstance %s failed", apiInstanceID)
+	if errMsg != "" {
+		desc = fmt.Sprintf("CertificateProbeFailed: probe of ApiInstance %s failed: %s", apiInstanceID, errMsg)
+	}
+	return append(
+		m.upsertFinding(apiInstanceID, finding.CertificateProbeFailed, desc),
+		m.deleteFinding(apiInstanceID, finding.CertificateExpiringSoon),
+		m.deleteFinding(apiInstanceID, finding.CertificateExpired),
+	)
 }
 
 func (m *metricMapper) upsertFinding(apiInstanceID uuid.UUID, kind finding.FindingKind, description string) []events.Event {

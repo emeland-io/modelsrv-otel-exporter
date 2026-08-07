@@ -33,8 +33,8 @@ Built as a minimal OpenTelemetry Collector distribution containing the **httpche
 
 ### Data flow
 
-1. The **httpcheck receiver** probes configured HTTPS endpoints and produces `httpcheck.tls.cert_remaining` gauge metrics (seconds until expiry).
-2. The **emeland exporter** looks up each `http.url` in its `endpoint_mapping` to find the corresponding ApiInstance UUID, then applies the threshold logic to produce or delete Findings.
+1. The **httpcheck receiver** probes configured HTTPS endpoints and produces `httpcheck.tls.cert_remaining` (seconds until expiry) and `httpcheck.error` (probe failures).
+2. The **emeland exporter** looks up each `http.url` in its `endpoint_mapping` to find the corresponding ApiInstance UUID, then applies the same decision table as native certprobe: probe errors → `CertificateProbeFailed`; remaining time → `CertificateExpiringSoon` / `CertificateExpired` / clear.
 3. Findings live in an in-memory modelsrv model exposed via the standard HTTP API.
 4. Downstream modelsrv instances subscribe and get finding events pushed in real time.
 

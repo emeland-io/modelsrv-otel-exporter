@@ -66,6 +66,38 @@ var _ = Describe("End-to-end: httpcheck -> exporter -> modelsrv API", func() {
 		}
 		Expect(found).To(BeTrue(), "expected a finding referencing ApiInstance %s", apiInstanceID)
 	})
+
+	It("maps a probe failure to CertificateProbeFailed visible via the HTTP API", func() {
+		apiInstanceID := "ffffffff-1111-2222-3333-444444444444"
+		endpointURL := "https://unreachable.example.com:443/health"
+		cfg := &emelandexporter.Config{
+			ListenAddr:      "localhost:24291",
+			ExpiryThreshold: 30 * 24 * time.Hour,
+			EndpointMapping: map[string]string{
+				endpointURL: apiInstanceID,
+			},
+		}
+
+		exp := emelandexporter.NewExporterForTest(cfg)
+		err := exp.Start(context.Background())
+		Expect(err).ToNot(HaveOccurred())
+		defer exp.Shutdown(context.Background())
+
+		md := buildErrorMetrics(endpointURL, "context deadline exceeded")
+		err = exp.ConsumeMetrics(context.Background(), md)
+		Expect(err).ToNot(HaveOccurred())
+
+		Eventually(func() bool {
+			for _, f := range getFindings("http://localhost:24291") {
+				desc, _ := f["description"].(string)
+				if containsSubstring(desc, "CertificateProbeFailed") &&
+					containsSubstring(desc, apiInstanceID) {
+					return true
+				}
+			}
+			return false
+		}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
+	})
 })
 
 // --- helpers ---

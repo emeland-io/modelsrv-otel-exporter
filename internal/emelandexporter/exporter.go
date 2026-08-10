@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"emeland.io/modelsrv-otel-exporter/internal/sensor"
+	"go.emeland.io/modelsrv/pkg/events"
 )
 
 const (
@@ -19,9 +20,16 @@ const (
 	// seconds until TLS certificate expiry. Negative values mean already expired.
 	metricCertRemaining = "httpcheck.tls.cert_remaining"
 
+	// metricHTTPCheckError is emitted by the httpcheck receiver when a probe
+	// fails (connection error, timeout, TLS handshake failure, etc.).
+	metricHTTPCheckError = "httpcheck.error"
+
 	// attrHTTPURL is the data-point attribute the httpcheck receiver uses to
 	// identify which endpoint was probed.
 	attrHTTPURL = "http.url"
+
+	// attrErrorMessage is set on httpcheck.error data points with the failure reason.
+	attrErrorMessage = "error.message"
 
 	// attrAPIInstanceID is a custom attribute that can optionally be injected
 	// (via an attributes processor) as a fallback when endpoint_mapping is not used.
@@ -73,23 +81,32 @@ func (e *emelandExporter) shutdown(_ context.Context) error {
 }
 
 // consumeMetrics is called by the Collector pipeline for each batch of metrics.
-// It walks the payload looking for httpcheck.tls.cert_remaining data points,
-// resolves the ApiInstance UUID (via endpoint_mapping or attribute), maps them
-// to Finding events, and emits them into the local modelsrv.
+// It processes httpcheck.error (probe failures → CertificateProbeFailed) first,
+// then httpcheck.tls.cert_remaining (success path). Cert metrics are applied
+// second so a successful TLS observation in the same batch wins over an error.
 func (e *emelandExporter) consumeMetrics(_ context.Context, md pmetric.Metrics) error {
 	var firstErr error
 
-	for ri := range md.ResourceMetrics().Len() {
-		rm := md.ResourceMetrics().At(ri)
-		for si := range rm.ScopeMetrics().Len() {
-			sm := rm.ScopeMetrics().At(si)
-			for mi := range sm.Metrics().Len() {
-				metric := sm.Metrics().At(mi)
-				if metric.Name() != metricCertRemaining {
-					continue
-				}
-				if err := e.processCertMetric(metric, rm); err != nil && firstErr == nil {
-					firstErr = err
+	for _, name := range []string{metricHTTPCheckError, metricCertRemaining} {
+		for ri := range md.ResourceMetrics().Len() {
+			rm := md.ResourceMetrics().At(ri)
+			for si := range rm.ScopeMetrics().Len() {
+				sm := rm.ScopeMetrics().At(si)
+				for mi := range sm.Metrics().Len() {
+					metric := sm.Metrics().At(mi)
+					if metric.Name() != name {
+						continue
+					}
+					var err error
+					switch name {
+					case metricHTTPCheckError:
+						err = e.processErrorMetric(metric, rm)
+					case metricCertRemaining:
+						err = e.processCertMetric(metric, rm)
+					}
+					if err != nil && firstErr == nil {
+						firstErr = err
+					}
 				}
 			}
 		}
@@ -98,15 +115,49 @@ func (e *emelandExporter) consumeMetrics(_ context.Context, md pmetric.Metrics) 
 	return firstErr
 }
 
-// processCertMetric handles a single httpcheck.tls.cert_remaining gauge.
-func (e *emelandExporter) processCertMetric(metric pmetric.Metric, rm pmetric.ResourceMetrics) error {
-	if metric.Type() != pmetric.MetricTypeGauge {
+// processErrorMetric handles httpcheck.error sum data points (value > 0 → probe failed).
+func (e *emelandExporter) processErrorMetric(metric pmetric.Metric, rm pmetric.ResourceMetrics) error {
+	dps, ok := numberDataPoints(metric)
+	if !ok {
 		return nil
 	}
 
 	var firstErr error
-	dps := metric.Gauge().DataPoints()
+	for i := range dps.Len() {
+		dp := dps.At(i)
+		if numberValue(dp) <= 0 {
+			continue
+		}
 
+		apiInstanceID := e.resolveAPIInstanceID(dp, rm)
+		if apiInstanceID == uuid.Nil {
+			e.logger.Debug("skipping data point: cannot resolve api_instance_id",
+				zap.String("metric", metric.Name()),
+			)
+			continue
+		}
+
+		errMsg := ""
+		if v, ok := dp.Attributes().Get(attrErrorMessage); ok {
+			errMsg = v.Str()
+		}
+
+		if err := e.emitEvents(e.mapper.ReconcileProbeFailed(apiInstanceID, errMsg)); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
+}
+
+// processCertMetric handles a single httpcheck.tls.cert_remaining gauge.
+func (e *emelandExporter) processCertMetric(metric pmetric.Metric, rm pmetric.ResourceMetrics) error {
+	dps, ok := numberDataPoints(metric)
+	if !ok {
+		return nil
+	}
+
+	var firstErr error
 	for i := range dps.Len() {
 		dp := dps.At(i)
 		apiInstanceID := e.resolveAPIInstanceID(dp, rm)
@@ -117,24 +168,53 @@ func (e *emelandExporter) processCertMetric(metric pmetric.Metric, rm pmetric.Re
 			continue
 		}
 
-		remainingSecs := dp.DoubleValue()
-		remaining := time.Duration(remainingSecs * float64(time.Second))
-
-		events := e.mapper.Reconcile(apiInstanceID, remaining)
-		for _, ev := range events {
-			if err := e.server.Emit(ev); err != nil {
-				e.logger.Error("failed to emit finding event",
-					zap.String("resourceId", ev.ResourceId.String()),
-					zap.Error(err),
-				)
-				if firstErr == nil {
-					firstErr = err
-				}
-			}
+		remaining := time.Duration(numberValue(dp) * float64(time.Second))
+		if err := e.emitEvents(e.mapper.Reconcile(apiInstanceID, remaining)); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 
 	return firstErr
+}
+
+func (e *emelandExporter) emitEvents(evs []events.Event) error {
+	var firstErr error
+	for _, ev := range evs {
+		if err := e.server.Emit(ev); err != nil {
+			e.logger.Error("failed to emit finding event",
+				zap.String("resourceId", ev.ResourceId.String()),
+				zap.Error(err),
+			)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+// numberDataPoints returns gauge or sum data points from a metric.
+func numberDataPoints(metric pmetric.Metric) (pmetric.NumberDataPointSlice, bool) {
+	switch metric.Type() {
+	case pmetric.MetricTypeGauge:
+		return metric.Gauge().DataPoints(), true
+	case pmetric.MetricTypeSum:
+		return metric.Sum().DataPoints(), true
+	default:
+		return pmetric.NumberDataPointSlice{}, false
+	}
+}
+
+// numberValue reads an int or double datapoint value (httpcheck uses ints).
+func numberValue(dp pmetric.NumberDataPoint) float64 {
+	switch dp.ValueType() {
+	case pmetric.NumberDataPointValueTypeInt:
+		return float64(dp.IntValue())
+	case pmetric.NumberDataPointValueTypeDouble:
+		return dp.DoubleValue()
+	default:
+		return 0
+	}
 }
 
 // resolveAPIInstanceID determines the ApiInstance UUID for a data point.

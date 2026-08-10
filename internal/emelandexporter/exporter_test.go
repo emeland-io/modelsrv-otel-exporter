@@ -78,6 +78,38 @@ var _ = Describe("ConsumeMetrics with endpoint_mapping", func() {
 		err = exp.ConsumeMetrics(context.Background(), md)
 		Expect(err).ToNot(HaveOccurred())
 	})
+
+	It("maps httpcheck.error to CertificateProbeFailed", func() {
+		cfg := &emelandexporter.Config{
+			ListenAddr:      "localhost:24253",
+			ExpiryThreshold: 30 * 24 * time.Hour,
+			EndpointMapping: map[string]string{
+				endpointURL: apiInstanceID.String(),
+			},
+		}
+
+		exp := emelandexporter.NewExporterForTest(cfg)
+		defer exp.Shutdown(context.Background())
+
+		err := exp.Start(context.Background())
+		Expect(err).ToNot(HaveOccurred())
+
+		md := buildErrorMetrics(endpointURL, "dial tcp: connection refused")
+		err = exp.ConsumeMetrics(context.Background(), md)
+		Expect(err).ToNot(HaveOccurred())
+
+		Eventually(func() bool {
+			for _, f := range getFindings("http://localhost:24253") {
+				desc, _ := f["description"].(string)
+				if containsSubstring(desc, "CertificateProbeFailed") &&
+					containsSubstring(desc, apiInstanceID.String()) &&
+					containsSubstring(desc, "connection refused") {
+					return true
+				}
+			}
+			return false
+		}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
+	})
 })
 
 // --- test helpers ---
@@ -92,8 +124,9 @@ func buildMetricsWithURL(url string, remainingSecs float64) pmetric.Metrics {
 	m.SetName("httpcheck.tls.cert_remaining")
 	m.SetUnit("s")
 
+	// httpcheck emits cert_remaining as an int gauge.
 	dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
-	dp.SetDoubleValue(remainingSecs)
+	dp.SetIntValue(int64(remainingSecs))
 	dp.Attributes().PutStr("http.url", url)
 
 	return md
@@ -112,8 +145,30 @@ func buildMetricsWithExplicitID(apiInstanceID uuid.UUID, remainingSecs float64) 
 	m.SetUnit("s")
 
 	dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
-	dp.SetDoubleValue(remainingSecs)
+	dp.SetIntValue(int64(remainingSecs))
 	dp.Attributes().PutStr("http.url", "https://whatever.example.com/")
+
+	return md
+}
+
+func buildErrorMetrics(url, errMsg string) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("otelcol/httpcheckreceiver")
+
+	m := sm.Metrics().AppendEmpty()
+	m.SetName("httpcheck.error")
+	m.SetUnit("{error}")
+
+	// httpcheck.error is a non-monotonic cumulative sum with value 1 on failure.
+	sum := m.SetEmptySum()
+	sum.SetIsMonotonic(false)
+	sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	dp := sum.DataPoints().AppendEmpty()
+	dp.SetIntValue(1)
+	dp.Attributes().PutStr("http.url", url)
+	dp.Attributes().PutStr("error.message", errMsg)
 
 	return md
 }
